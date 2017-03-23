@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+
+{ # this ensures the entire script is downloaded #
+
+# Some commands
+CMND_WHICH="/usr/bin/which"
+CMND_LOGGER="`$CMND_WHICH logger`"
+CMND_MEGACLI="`$CMND_WHICH megacli`"
+CMND_DMIDECODE="`$CMND_WHICH dmidecode`"
+
+# Logger global options
+LOGGER_TAG=${0##*/}
+LOGGER_PID=$PPID
+
+# Return codes (Nagios compatible)
+CODE_OK=0
+CODE_WARNING=1
+CODE_CRITICAL=2
+CODE_UNKNOWN=3
+CODE_DEPENDENT=4
+
+# function usg()  # print usage and exit
+# usage: usg
+#
+function usg {
+  cat <<EOF
+Usage: $0 [OPTS]
+
+Uses 'logger' bultin and 'megacli' command to check the status of disks attached to an LSI controller.
+
+OPTS:
+  --html  Use '<br>' as line separator.
+  --text  Use '\n' as line sepearator.
+  --help  Show this help message and exit.
+
+TODO:
+  [x] iterate over all available adapters. For now, assume there's only one 1)
+  [x] this check will probably fail if you have more than one adapter in a host
+EOF
+  exit 0
+}
+
+# function has()     # check if command exists
+# usage: has command...
+#
+function has {
+  local CMND
+
+  for CMND in "$@" ; do
+    type "$1" > /dev/null 2>&1 || \
+      out $CODE_UNKNOWN Unknown: file $CMND is not found or not executable
+  done
+}
+
+# function out()     # output optional message and exit with coode
+# usage: out exitcode [message]
+#
+function out {
+  local MESSAGE="${@:2}"
+
+  if [ -n "$MESSAGE" ] ; then
+    has "$CMND_LOGGER" && \
+      $CMND_LOGGER -t $LOGGER_TAG[$LOGGER_PID] $MESSAGE && \
+      echo "$MESSAGE" | awk -F': ' '{ printf "%s - %s. %s.", toupper($1), $2, $3 }'
+  fi
+
+  exit ${1:-0}
+}
+
+# function run()     # run MegaRAID check command
+# usage: run [ --html | --text ]
+#
+function run {
+  local LINEFEED
+  local SYSTEM_SN
+  local REPORT
+  local VIRTUAL_DRIVE
+  local LDINFO
+  local SIZE
+  local STATE
+  local MISSING_DISK_INFO
+  local NUMBER
+  local ARRAY
+  local ROW
+  local UNIT
+  local MISSING_REPORT
+  local ENCLOSURE_ID
+  local SLOT
+  local DISKINFO
+  local DISK_TYPE
+  local DISK_WWN
+  local DISK_SERIAL
+  local ERRORLINES
+  local DISKREPORT
+  local REBUILD_PROGRESS
+
+  case "$1" in
+    --help)
+      usg
+      ;;
+    --html)
+      LINEFEED="<br>"
+      ;;
+    --text)
+      LINEFEED="\n"
+      ;;
+    *)
+      LINEFEED=" --- "
+      ;;
+  esac
+
+  ADAPTER=0 # TODO 1)
+  SYSTEM_SN=`$CMND_DMIDECODE | grep 'Base Board Information' -A 5 | grep 'Serial Number' | sed -e 's/.*: //'`
+
+  # Report virtual drive issues (partially degraded, degraded)
+  for VIRTUAL_DRIVE in `$CMND_MEGACLI -LDInfo -Lall -a$ADAPTER | grep -o 'Virtual Drive: [0-9]\+' | sed -e 's/.*: //'` ; do
+    LDINFO=`$CMND_MEGACLI -LDInfo -L${VIRTUAL_DRIVE} -a$ADAPTER`
+    SIZE=`echo "$LDINFO" | grep '^Size' | sed -e 's/.*: //'`
+    STATE=`echo "$LDINFO" | grep '^State' | sed -e 's/.*: //'`
+    if [ "$STATE" != "Optimal" ] ; then
+      if [ -z "$REPORT" ] ; then
+        REPORT="Virtual drive $VIRTUAL_DRIVE ($SIZE): $STATE"
+      else
+        REPORT="${REPORT}${LINEFEED}Virtual drive $VIRTUAL_DRIVE ($SIZE): $STATE"
+      fi
+    fi
+  done
+
+  # Report missing disks
+  MISSING_DISK_INFO=`$CMND_MEGACLI -PdGetMissing -a$ADAPTER`
+  if echo "$MISSING_DISK_INFO" | grep --silent 'Adapter.*Missing Physical drives' ; then
+    while read line ; do
+      NUMBER=`echo "$line" | awk 'print $1'`
+      ARRAY=`echo "$line" | awk 'print $2'`
+      ROW=`echo "$line" | awk 'print $3'`
+      SIZE=`echo "$line" | awk 'print $4'`
+      UNIT=`echo "$line" | awk 'print $5'`
+      MISSING_REPORT="Missing disk: Nr=$NUMBER Array=$ARRAY Row=$ROW Size=$SIZE $UNIT"
+      if [ -z "$REPORT" ] ; then
+        REPORT="$MISSING_REPORT"
+      else
+        REPORT="${REPORT}${LINEFEED}${MISSING_REPORT}"
+      fi
+    done < <(echo "$MISSING_DISK_INFO" | grep -o '[0-9]\+[[:space:]]\+[0-9]\+[[:space:]]\+[0-9]\+[[:space:]]\+[0-9]\+[[:space:]]*[KMGT]B')
+  fi
+
+  # Report physical drive errors
+  for ENCLOSURE_ID in `$CMND_MEGACLI -PDList -a$ADAPTER | grep "Enclosure Device" | awk '{print $4}' | sort -nu` ;do
+    for SLOT in `$CMND_MEGACLI -PDList -a$ADAPTER | grep -A 1 "Enclosure Device ID: $ENCLOSURE_ID" | grep "Slot Number" | awk '{print $3}'` ; do
+      DISKINFO=`$CMND_MEGACLI -pdinfo -PhysDrv [$ENCLOSURE_ID:$SLOT] -a$ADAPTER`
+      DISK_TYPE=`echo "$DISKINFO" | grep 'PD Type:' | sed -e 's/.*: //'`
+      DISK_WWN=`echo "$DISKINFO" | grep 'WWN:' | sed -e 's/.*: //'`
+      DISK_SERIAL=`echo "$DISKINFO" | grep 'Inquiry Data:' | sed -e 's/.*: //'`
+      SIZE=`echo "$DISKINFO" | grep 'Raw Size:' | sed -e 's/.*: //' | sed -e 's/ \[0x.*//'`
+      ERRORLINES=`echo "$DISKINFO" | grep 'Count: [1-9]\|Firmware state:' | grep -v 'Firmware state: Online'`
+      if [ -n "$ERRORLINES" ] ; then
+        DISKREPORT=""
+        while read line ; do
+          if echo "$line" | grep --silent 'Rebuild' ; then
+            REBUILD_PROGRESS=`$CMND_MEGACLI -pdrbld -showprog -physdrv [$ENCLOSURE_ID:$SLOT] -a$ADAPTER | grep -o 'Completed [0-9]\+%'`
+            line="$line ($REBUILD_PROGRESS)"
+          fi
+          if [ -z "$DISKREPORT" ] ; then
+            DISKREPORT=`echo Enclosure/slot [$ENCLOSURE_ID:$SLOT] WWN=$DISK_WWN $DISK_SERIAL "($SIZE)" - $line`
+          else
+            DISKREPORT="$DISKREPORT - `echo $line`"
+          fi
+        done < <(echo "$ERRORLINES")
+        if [ -z "$REPORT" ] ; then
+          REPORT="$DISKREPORT"
+        else
+          REPORT="${REPORT}${LINEFEED}${DISKREPORT}"
+        fi
+      fi
+    done
+  done
+
+  if [ -z "$REPORT" ] ; then
+    out $CODE_OK Online: System S/N=$SYSTEM_SN: No disk problems found
+  else
+    out $CODE_CRITICAL Critical: System S/N=$SYSTEM_SN: ${LINEFEED}${REPORT}
+  fi
+}
+
+# Check if commands exists
+has "$CMND_MEGACLI" "$CMND_DMIDECODE"
+
+# Execute the magic!
+run $@
+
+} # this ensures the entire script is downloaded #
