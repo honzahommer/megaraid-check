@@ -17,7 +17,7 @@ apt install megacli dmidecode
 megaraid-check [Options]
 ```
 
-## Options:
+### Options
 
 ```
 --html  Use '<br>' as line separator.
@@ -25,7 +25,7 @@ megaraid-check [Options]
 --help  Show help message and exit.
 ```
 
-## Todo:
+## Todo
 
 - [ ] Iterate over all available adapters. For now, assume there's only one.
 - [ ] This check will probably fail if you have more than one adapter in a host.
